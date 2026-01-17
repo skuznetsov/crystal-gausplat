@@ -96,7 +96,7 @@ module GS
       def detect(image : Tensor) : Array(Detection)
         raise "Model not loaded" unless loaded?
         raise "Image must be on CPU" unless image.on_cpu?
-        raise "Image must have 3 dimensions [H, W, 3]" unless image.shape.rank == 3
+        raise "Image must have 3 dimensions [H, W, 3]" unless image.shape.ndim == 3
 
         height = image.shape[0]
         width = image.shape[1]
