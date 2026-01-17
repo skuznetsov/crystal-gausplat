@@ -22,6 +22,7 @@ require "./gaussian_splatting/rasterizer"
 require "./gaussian_splatting/rasterizer_context"
 require "./gaussian_splatting/trainer"
 require "./mastr/model"
+require "./mastr/inference"
 require "./export/marching_cubes"
 require "./export/stl"
 require "./utils/image_io"
@@ -192,53 +193,74 @@ module GS
     puts "  FPS: #{sprintf("%.2f", info.fps)}"
     puts "  Frames: ~#{info.frame_count}"
 
-    # Select frame extraction criteria
-    criteria = case quality
-               when "fast"
-                 Video::SelectionCriteria.fast
-               when "thorough"
-                 Video::SelectionCriteria.thorough
-               else
-                 Video::SelectionCriteria.new(max_frames: max_frames)
-               end
-    criteria = Video::SelectionCriteria.new(
-      min_sharpness: criteria.min_sharpness,
-      min_brightness: criteria.min_brightness,
-      max_brightness: criteria.max_brightness,
-      min_motion: criteria.min_motion,
-      max_frames: max_frames,
-      uniform_distribution: true
-    )
+    # Extract frames based on quality setting
+    frames = [] of Video::Frame
 
-    selector = Video::FrameSelector.new(reader, criteria)
+    if quality == "simple"
+      # Simple mode: just take N frames uniformly distributed
+      puts "  Mode: simple (uniform sampling)"
+      frames = reader.read_uniform(max_frames)
+      reader.close
+    else
+      # Quality-based selection with filtering
+      criteria = case quality
+                 when "fast"
+                   Video::SelectionCriteria.fast
+                 when "thorough"
+                   Video::SelectionCriteria.thorough
+                 else
+                   Video::SelectionCriteria.new(max_frames: max_frames)
+                 end
+      criteria = Video::SelectionCriteria.new(
+        min_sharpness: criteria.min_sharpness,
+        min_brightness: criteria.min_brightness,
+        max_brightness: criteria.max_brightness,
+        min_motion: criteria.min_motion,
+        max_frames: max_frames,
+        uniform_distribution: true
+      )
 
-    frames = selector.select_with_progress do |current, total|
-      print "\r  Analyzing: #{current}/#{total} frames..."
-      STDOUT.flush
+      selector = Video::FrameSelector.new(reader, criteria)
+
+      frames = selector.select_with_progress do |current, total|
+        print "\r  Analyzing: #{current}/#{total} frames..."
+        STDOUT.flush
+      end
+      puts
+
+      reader.close
     end
-    puts
-
-    reader.close
 
     puts "  Selected #{frames.size} frames"
 
     if frames.empty?
-      puts "Error: No suitable frames found. Try lowering quality threshold."
+      puts "Error: No suitable frames found. Try --quality simple"
       return
     end
 
     # Step 2: Initialize MASt3R for dense stereo
     puts "\nStep 2: Running MASt3R dense stereo..."
 
-    # For now, use frame pairs to estimate depth
-    # TODO: Full MASt3R inference when weights are loaded
-    puts "  (Using placeholder - MASt3R weights not loaded)"
-    puts "  Generating point cloud from frame differences..."
+    weights_path = "models/mastr/model.safetensors"
+    points : Tensor
 
-    # Simple point cloud generation from frames
-    # In real implementation, MASt3R would provide dense depth
-    points = generate_points_from_frames(frames)
-    puts "  Generated #{points.shape[0]} points"
+    if File.exists?(weights_path)
+      puts "  Loading MASt3R model with pretrained weights..."
+      # Try GPU if available
+      device = Metal::Device.available? ? Tensor::Device::GPU : Tensor::Device::CPU
+      puts "  Using device: #{device.gpu? ? "GPU" : "CPU"}"
+      mastr = MASt3R::MASt3RInference.new(device)
+      mastr.load_weights!(weights_path)
+
+      puts "  Processing #{frames.size} frames..."
+      points, confs = mastr.frames_to_pointcloud(frames, conf_threshold: 0.3_f32)
+      puts "  Generated #{points.shape[0]} points with MASt3R"
+    else
+      puts "  Warning: MASt3R weights not found at #{weights_path}"
+      puts "  Using placeholder point cloud generation..."
+      points = generate_points_from_frames(frames)
+      puts "  Generated #{points.shape[0]} points (placeholder)"
+    end
 
     # Step 3: Initialize Gaussians
     puts "\nStep 3: Initializing Gaussians..."

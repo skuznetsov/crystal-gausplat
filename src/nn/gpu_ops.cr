@@ -469,6 +469,62 @@ module GS
           encoder.dispatch_2d(out_features, batch, {TILE_SIZE, TILE_SIZE})
         end
       end
+
+      # Conv2D forward: output = conv2d(input, weight) + bias
+      # input: [batch, H, W, in_channels] (NHWC format)
+      # weight: [out_channels, in_channels, kH, kW] (OIHW format)
+      # bias: [out_channels] or nil
+      # output: [batch, H_out, W_out, out_channels]
+      def conv2d_forward(
+        input : Tensor,
+        weight : Tensor,
+        bias : Tensor?,
+        output : Tensor,
+        stride : Int32 = 1,
+        padding : Int32 = 1,
+        fuse_relu : Bool = false
+      ) : Nil
+        ensure_initialized
+
+        batch = input.shape[0]
+        in_h = input.shape[1]
+        in_w = input.shape[2]
+        in_channels = input.shape[3]
+
+        out_channels = weight.shape[0]
+        kernel_h = weight.shape[2]
+        kernel_w = weight.shape[3]
+
+        out_h = (in_h + 2 * padding - kernel_h) // stride + 1
+        out_w = (in_w + 2 * padding - kernel_w) // stride + 1
+
+        use_bias = bias ? 1_u32 : 0_u32
+        kernel_name = fuse_relu ? "conv2d_forward_relu" : "conv2d_forward"
+        pipeline = get_pipeline(kernel_name)
+
+        # Create dummy bias buffer if not provided
+        bias_buf = bias.try(&.buffer) || input.buffer.not_nil!
+
+        Metal::Dispatch.execute(pipeline) do |encoder|
+          encoder.set_buffer(input.buffer.not_nil!, 0)
+          encoder.set_buffer(weight.buffer.not_nil!, 1)
+          encoder.set_buffer(bias_buf, 2)
+          encoder.set_buffer(output.buffer.not_nil!, 3)
+          encoder.set_value(batch.to_u32, 4)
+          encoder.set_value(in_h.to_u32, 5)
+          encoder.set_value(in_w.to_u32, 6)
+          encoder.set_value(in_channels.to_u32, 7)
+          encoder.set_value(out_channels.to_u32, 8)
+          encoder.set_value(kernel_h.to_u32, 9)
+          encoder.set_value(kernel_w.to_u32, 10)
+          encoder.set_value(stride.to_u32, 11)
+          encoder.set_value(padding.to_u32, 12)
+          encoder.set_value(use_bias, 13)
+
+          # Dispatch: (out_w, out_h, batch * out_channels)
+          encoder.dispatch_3d(out_w, out_h, batch * out_channels, {8, 8, 4})
+        end
+      end
     end
   end
 end

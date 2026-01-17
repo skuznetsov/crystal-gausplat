@@ -125,12 +125,24 @@ module GS
         puts "DPT head loaded"
       end
 
+      # Tensors not needed for inference (from MAE pretraining)
+      EXPECTED_UNUSED = ["mask_token"]
+
       # Summary
       def summary
         puts "Weight loading complete: #{@loaded_count}/#{@total_count} tensors loaded"
-        if @loaded_count < @total_count
-          missing = @total_count - @loaded_count
-          puts "Warning: #{missing} tensors not loaded (may be unused or architecture mismatch)"
+
+        # Check for unexpected unloaded tensors
+        unexpected = [] of String
+        @loader.tensor_names.each do |name|
+          unless @loader.loaded_names.includes?(name) || EXPECTED_UNUSED.includes?(name)
+            unexpected << name
+          end
+        end
+
+        if unexpected.size > 0
+          puts "Warning: #{unexpected.size} unexpected tensors not loaded:"
+          unexpected.each { |name| puts "  Unloaded: #{name}" }
         end
       end
 
@@ -149,9 +161,12 @@ module GS
         weight_flat = reshape_tensor(weight, Shape.new(out_channels, in_features))
 
         copy_to_variable!(patch_embed.proj.weight, weight_flat)
-        copy_to_variable!(patch_embed.proj.bias, bias)
-
-        @loaded_count += 2
+        if b = patch_embed.proj.bias
+          copy_to_variable!(b, bias)
+          @loaded_count += 2
+        else
+          @loaded_count += 1
+        end
       end
 
       private def load_encoder_block!(block : MASt3REncoderBlockV2, idx : Int32)
@@ -200,18 +215,27 @@ module GS
         q_bias, k_bias, v_bias = split_qkv_bias(qkv_bias, embed_dim)
 
         copy_to_variable!(attn.q_proj.weight, q_weight)
-        copy_to_variable!(attn.q_proj.bias, q_bias)
         copy_to_variable!(attn.k_proj.weight, k_weight)
-        copy_to_variable!(attn.k_proj.bias, k_bias)
         copy_to_variable!(attn.v_proj.weight, v_weight)
-        copy_to_variable!(attn.v_proj.bias, v_bias)
+
+        if b = attn.q_proj.bias
+          copy_to_variable!(b, q_bias)
+        end
+        if b = attn.k_proj.bias
+          copy_to_variable!(b, k_bias)
+        end
+        if b = attn.v_proj.bias
+          copy_to_variable!(b, v_bias)
+        end
 
         # Output projection
         proj_weight = @loader.load_tensor("#{prefix}.proj.weight", Tensor::Device::CPU)
         proj_bias = @loader.load_tensor("#{prefix}.proj.bias", Tensor::Device::CPU)
 
         copy_to_variable!(attn.out_proj.weight, proj_weight)
-        copy_to_variable!(attn.out_proj.bias, proj_bias)
+        if b = attn.out_proj.bias
+          copy_to_variable!(b, proj_bias)
+        end
 
         @loaded_count += 4
       end
@@ -227,7 +251,9 @@ module GS
         proj_weight = @loader.load_tensor("#{prefix}.proj.weight", Tensor::Device::CPU)
         proj_bias = @loader.load_tensor("#{prefix}.proj.bias", Tensor::Device::CPU)
         copy_to_variable!(attn.out_proj.weight, proj_weight)
-        copy_to_variable!(attn.out_proj.bias, proj_bias)
+        if b = attn.out_proj.bias
+          copy_to_variable!(b, proj_bias)
+        end
 
         @loaded_count += 2
       end
@@ -242,9 +268,12 @@ module GS
         bias = @loader.load_tensor("#{key}.bias", Tensor::Device::CPU)
 
         copy_to_variable!(linear.weight, weight)
-        copy_to_variable!(linear.bias, bias)
-
-        @loaded_count += 2
+        if b = linear.bias
+          copy_to_variable!(b, bias)
+          @loaded_count += 2
+        else
+          @loaded_count += 1
+        end
       end
 
       private def load_layernorm!(ln : NN::LayerNorm, key : String)
@@ -262,9 +291,12 @@ module GS
         bias = @loader.load_tensor("#{key}.bias", Tensor::Device::CPU)
 
         copy_to_variable!(conv.weight, weight)
-        copy_to_variable!(conv.bias, bias)
-
-        @loaded_count += 2
+        if b = conv.bias
+          copy_to_variable!(b, bias)
+          @loaded_count += 2
+        else
+          @loaded_count += 1
+        end
       end
 
       private def load_conv2d_no_bias!(conv, key : String)

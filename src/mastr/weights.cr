@@ -26,18 +26,52 @@ module GS
       end
     end
 
-    # Safetensors file reader
+    # Safetensors file reader with mmap support (like llama.cpp)
     class SafetensorsLoader
       getter path : String
       getter tensors : Hash(String, TensorInfo)
+      getter loaded_names : Set(String)
       @header_size : Int64
       @data_offset : Int64
+      @mmap_ptr : Pointer(UInt8)?
+      @mmap_size : UInt64 = 0
 
       def initialize(@path : String)
         @tensors = Hash(String, TensorInfo).new
+        @loaded_names = Set(String).new
         @header_size = 0_i64
         @data_offset = 0_i64
+        @mmap_ptr = nil
         parse_header!
+        mmap_file!  # Memory-map the entire file
+      end
+
+      def finalize
+        munmap_file!
+      end
+
+      # Memory-map the file for fast direct access
+      private def mmap_file!
+        file_size = File.size(@path).to_u64
+        fd = LibC.open(@path, LibC::O_RDONLY)
+        raise "Failed to open file for mmap" if fd < 0
+
+        ptr = LibC.mmap(nil, file_size, LibC::PROT_READ, LibC::MAP_PRIVATE, fd, 0)
+        LibC.close(fd)
+
+        if ptr == Pointer(Void).new(-1)
+          raise "mmap failed"
+        end
+
+        @mmap_ptr = ptr.as(Pointer(UInt8))
+        @mmap_size = file_size
+      end
+
+      private def munmap_file!
+        if ptr = @mmap_ptr
+          LibC.munmap(ptr.as(Pointer(Void)), @mmap_size)
+          @mmap_ptr = nil
+        end
       end
 
       # List all tensor names
@@ -55,6 +89,7 @@ module GS
         info = @tensors[name]?
         raise "Tensor '#{name}' not found in #{@path}" unless info
 
+        @loaded_names << name
         load_tensor_data(info, device)
       end
 
@@ -117,7 +152,7 @@ module GS
         end
       end
 
-      # Load tensor data from file
+      # Load tensor data from mmap (fast, no file I/O)
       private def load_tensor_data(info : TensorInfo, device : Tensor::Device) : Tensor
         # Convert shape to Int32
         shape = Shape.new(info.shape.map(&.to_i32))
@@ -128,21 +163,18 @@ module GS
 
         raise "Tensor size mismatch: expected #{expected_bytes}, got #{info.byte_size}" unless expected_bytes == info.byte_size
 
-        # Read raw bytes
-        bytes = Bytes.new(info.byte_size)
-        File.open(@path, "rb") do |file|
-          file.seek(@data_offset + info.data_start)
-          file.read_fully(bytes)
-        end
+        # Get pointer directly from mmap (no copy!)
+        mmap = @mmap_ptr.not_nil!
+        data_ptr = mmap + @data_offset + info.data_start
 
-        # Convert to Float32 array
+        # Convert to Float32 array from mmap pointer
         data = case info.dtype
                when "F32"
-                 bytes_to_f32_array(bytes)
+                 mmap_to_f32_array(data_ptr, info.numel.to_i32)
                when "F16"
-                 bytes_to_f16_array(bytes)
+                 mmap_to_f16_array(data_ptr, info.numel.to_i32)
                when "BF16"
-                 bytes_to_bf16_array(bytes)
+                 mmap_to_bf16_array(data_ptr, info.numel.to_i32)
                else
                  raise "Unsupported dtype: #{info.dtype}"
                end
@@ -162,6 +194,35 @@ module GS
         end
       end
 
+      # Fast mmap-based conversion: directly cast F32 pointer
+      private def mmap_to_f32_array(ptr : Pointer(UInt8), count : Int32) : Array(Float32)
+        # Direct pointer cast - no conversion needed for F32!
+        f32_ptr = ptr.as(Pointer(Float32))
+        result = Array(Float32).new(count)
+        count.times { |i| result << f32_ptr[i] }
+        result
+      end
+
+      # Fast mmap-based FP16 conversion
+      private def mmap_to_f16_array(ptr : Pointer(UInt8), count : Int32) : Array(Float32)
+        f16_ptr = ptr.as(Pointer(UInt16))
+        result = Array(Float32).new(count)
+        count.times { |i| result << fp16_to_fp32(f16_ptr[i]) }
+        result
+      end
+
+      # Fast mmap-based BF16 conversion
+      private def mmap_to_bf16_array(ptr : Pointer(UInt8), count : Int32) : Array(Float32)
+        bf16_ptr = ptr.as(Pointer(UInt16))
+        result = Array(Float32).new(count)
+        count.times do |i|
+          f32_bits = bf16_ptr[i].to_u32 << 16
+          result << f32_bits.unsafe_as(Float32)
+        end
+        result
+      end
+
+      # Legacy bytes-based methods (kept for compatibility)
       private def bytes_to_f32_array(bytes : Bytes) : Array(Float32)
         count = bytes.size // 4
         result = Array(Float32).new(count)

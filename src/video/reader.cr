@@ -209,7 +209,8 @@ module GS
           end
 
           # EAGAIN means we need more packets
-          next if ret == -11  # AVERROR(EAGAIN)
+          # Note: EAGAIN is 11 on Linux, 35 on macOS
+          next if ret == -11 || ret == -35  # AVERROR(EAGAIN)
 
           # Other error
           break

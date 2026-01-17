@@ -222,15 +222,17 @@ module GS
       return self if @device.cpu?
 
       # Create new CPU tensor and copy data from GPU buffer
-      cpu_tensor = Tensor.new(
+      buf = @buffer.not_nil!
+      data = buf.read(@shape.numel)
+
+      Tensor.new(
         @shape,
         Strides.new(@shape),
         @dtype,
         Device::CPU,
         nil,
-        @buffer.not_nil!.read(@shape.numel)
+        data
       )
-      cpu_tensor
     end
 
     def to_cpu! : self

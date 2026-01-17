@@ -192,7 +192,11 @@ module GS
         result = Tensor.new(x.data.shape, x.data.dtype, Tensor::Device::CPU)
         x_d = x_data.cpu_data.not_nil!
         r_d = result.cpu_data.not_nil!
-        freqs_d = @rope_freqs.not_nil!.cpu_data.not_nil!
+
+        # Convert RoPE freqs to CPU if needed
+        rope = @rope_freqs.not_nil!
+        freqs_data = rope.on_cpu? ? rope : rope.to_cpu
+        freqs_d = freqs_data.cpu_data.not_nil!
 
         head_dim = embed_dim // @config.num_heads
         half_head_dim = head_dim // 2

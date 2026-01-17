@@ -1085,3 +1085,145 @@ kernel void reshape_from_heads(
 
     output[out_idx] = input[in_idx];
 }
+
+// ============================================================================
+// Conv2D Forward (NHWC format, optimized for small kernels)
+// ============================================================================
+
+// Conv2D forward: output = conv2d(input, weight) + bias
+// input: [batch, H, W, in_channels] (NHWC format)
+// weight: [out_channels, in_channels, kH, kW] (OIHW format)
+// bias: [out_channels] or nullptr
+// output: [batch, H_out, W_out, out_channels]
+kernel void conv2d_forward(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& batch [[buffer(4)]],
+    constant uint& in_h [[buffer(5)]],
+    constant uint& in_w [[buffer(6)]],
+    constant uint& in_channels [[buffer(7)]],
+    constant uint& out_channels [[buffer(8)]],
+    constant uint& kernel_h [[buffer(9)]],
+    constant uint& kernel_w [[buffer(10)]],
+    constant uint& stride [[buffer(11)]],
+    constant uint& padding [[buffer(12)]],
+    constant uint& use_bias [[buffer(13)]],
+    uint3 gid [[thread_position_in_grid]]  // (out_w, out_h, batch * out_channels)
+) {
+    uint ox = gid.x;  // output x
+    uint oy = gid.y;  // output y
+    uint boc = gid.z; // batch * out_channels + out_channel
+
+    uint out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
+    uint out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+
+    if (ox >= out_w || oy >= out_h || boc >= batch * out_channels) return;
+
+    uint b = boc / out_channels;
+    uint oc = boc % out_channels;
+
+    float sum = 0.0f;
+
+    // Convolution kernel loop
+    for (uint kh = 0; kh < kernel_h; kh++) {
+        for (uint kw = 0; kw < kernel_w; kw++) {
+            int ih = (int)(oy * stride + kh) - (int)padding;
+            int iw = (int)(ox * stride + kw) - (int)padding;
+
+            if (ih >= 0 && ih < (int)in_h && iw >= 0 && iw < (int)in_w) {
+                for (uint ic = 0; ic < in_channels; ic++) {
+                    // Input: [batch, H, W, in_channels] - NHWC
+                    uint in_idx = b * in_h * in_w * in_channels +
+                                  ih * in_w * in_channels +
+                                  iw * in_channels + ic;
+
+                    // Weight: [out_channels, in_channels, kH, kW] - OIHW
+                    uint w_idx = oc * in_channels * kernel_h * kernel_w +
+                                 ic * kernel_h * kernel_w +
+                                 kh * kernel_w + kw;
+
+                    sum += input[in_idx] * weight[w_idx];
+                }
+            }
+        }
+    }
+
+    // Add bias
+    if (use_bias != 0) {
+        sum += bias[oc];
+    }
+
+    // Output: [batch, H_out, W_out, out_channels] - NHWC
+    uint out_idx = b * out_h * out_w * out_channels +
+                   oy * out_w * out_channels +
+                   ox * out_channels + oc;
+
+    output[out_idx] = sum;
+}
+
+// Conv2D forward with ReLU fused
+kernel void conv2d_forward_relu(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& batch [[buffer(4)]],
+    constant uint& in_h [[buffer(5)]],
+    constant uint& in_w [[buffer(6)]],
+    constant uint& in_channels [[buffer(7)]],
+    constant uint& out_channels [[buffer(8)]],
+    constant uint& kernel_h [[buffer(9)]],
+    constant uint& kernel_w [[buffer(10)]],
+    constant uint& stride [[buffer(11)]],
+    constant uint& padding [[buffer(12)]],
+    constant uint& use_bias [[buffer(13)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint ox = gid.x;
+    uint oy = gid.y;
+    uint boc = gid.z;
+
+    uint out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
+    uint out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+
+    if (ox >= out_w || oy >= out_h || boc >= batch * out_channels) return;
+
+    uint b = boc / out_channels;
+    uint oc = boc % out_channels;
+
+    float sum = 0.0f;
+
+    for (uint kh = 0; kh < kernel_h; kh++) {
+        for (uint kw = 0; kw < kernel_w; kw++) {
+            int ih = (int)(oy * stride + kh) - (int)padding;
+            int iw = (int)(ox * stride + kw) - (int)padding;
+
+            if (ih >= 0 && ih < (int)in_h && iw >= 0 && iw < (int)in_w) {
+                for (uint ic = 0; ic < in_channels; ic++) {
+                    uint in_idx = b * in_h * in_w * in_channels +
+                                  ih * in_w * in_channels +
+                                  iw * in_channels + ic;
+                    uint w_idx = oc * in_channels * kernel_h * kernel_w +
+                                 ic * kernel_h * kernel_w +
+                                 kh * kernel_w + kw;
+                    sum += input[in_idx] * weight[w_idx];
+                }
+            }
+        }
+    }
+
+    if (use_bias != 0) {
+        sum += bias[oc];
+    }
+
+    // ReLU fused
+    sum = max(0.0f, sum);
+
+    uint out_idx = b * out_h * out_w * out_channels +
+                   oy * out_w * out_channels +
+                   ox * out_channels + oc;
+
+    output[out_idx] = sum;
+}

@@ -4,8 +4,10 @@
 require "../nn/linear"
 require "../nn/layernorm"
 require "../nn/attention"
+require "../nn/gpu_ops"
 require "../autograd/variable"
 require "../core/tensor"
+require "../metal/device"
 
 module GS
   module MASt3R
@@ -166,17 +168,20 @@ module GS
       # enc1, enc2: [batch, seq, encoder_dim]
       # Returns: {dec1, dec2} each [batch, seq, embed_dim]
       def forward_pair(enc1 : Autograd::Variable, enc2 : Autograd::Variable) : {Autograd::Variable, Autograd::Variable}
-        # Project to decoder dimension
+        # Project to decoder dimension (both for decoding and for cross-attention K/V)
         dec1 = @embed_proj.forward(enc1)
         dec2 = @embed_proj.forward(enc2)
 
+        # Use projected encoder outputs for cross-attention (already in decoder dim)
+        enc1_proj = dec1  # Encoder output projected to decoder dim
+        enc2_proj = dec2
+
         # Through decoder blocks with cross-attention between views
         @config.depth.times do |i|
-          # First decoder uses blocks, attends to enc1
-          # Second decoder uses blocks2, attends to enc2
-          # But they also cross-attend to each other
-          dec1_new = @blocks[i].forward(dec1, enc1)
-          dec2_new = @blocks2[i].forward(dec2, enc2)
+          # First decoder uses blocks, attends to projected enc1
+          # Second decoder uses blocks2, attends to projected enc2
+          dec1_new = @blocks[i].forward(dec1, enc1_proj)
+          dec2_new = @blocks2[i].forward(dec2, enc2_proj)
 
           dec1 = dec1_new
           dec2 = dec2_new
@@ -231,9 +236,49 @@ module GS
         end
       end
 
-      # Simple convolution (CPU, for inference)
+      # Convolution forward (GPU when available, CPU fallback)
       # x: [batch, height, width, in_channels]
       def forward(x : Autograd::Variable) : Autograd::Variable
+        # Use GPU path if input is on GPU
+        if x.data.on_gpu? && Metal::Device.available?
+          return forward_gpu(x)
+        end
+
+        forward_cpu(x)
+      end
+
+      # GPU convolution using Metal kernel
+      private def forward_gpu(x : Autograd::Variable) : Autograd::Variable
+        batch = x.data.shape[0]
+        h_in = x.data.shape[1]
+        w_in = x.data.shape[2]
+
+        h_out = (h_in + 2 * @padding - @kernel_size) // @stride + 1
+        w_out = (w_in + 2 * @padding - @kernel_size) // @stride + 1
+
+        # Ensure weight is on GPU
+        weight_gpu = @weight.data.on_gpu? ? @weight.data : @weight.data.to_gpu
+        bias_gpu = @bias.try { |b| b.data.on_gpu? ? b.data : b.data.to_gpu }
+
+        # Allocate output on GPU
+        result = Tensor.new(batch, h_out, w_out, @out_channels, device: Tensor::Device::GPU)
+
+        # Dispatch GPU kernel
+        NN::GPUOps.conv2d_forward(
+          x.data,
+          weight_gpu,
+          bias_gpu,
+          result,
+          stride: @stride,
+          padding: @padding,
+          fuse_relu: false
+        )
+
+        Autograd::Variable.new(result, x.requires_grad?)
+      end
+
+      # CPU convolution fallback
+      private def forward_cpu(x : Autograd::Variable) : Autograd::Variable
         x_data = x.data.on_cpu? ? x.data : x.data.to_cpu
         w_data = @weight.data.on_cpu? ? @weight.data : @weight.data.to_cpu
 
@@ -249,7 +294,7 @@ module GS
         x_d = x_data.cpu_data.not_nil!
         w_d = w_data.cpu_data.not_nil!
 
-        # Simple convolution (slow but correct)
+        # Simple convolution
         batch.times do |b|
           h_out.times do |oh|
             w_out.times do |ow|
@@ -280,7 +325,8 @@ module GS
 
         # Add bias
         if b = @bias
-          b_d = b.data.cpu_data.not_nil!
+          b_data = b.data.on_cpu? ? b.data : b.data.to_cpu
+          b_d = b_data.cpu_data.not_nil!
           batch.times do |bi|
             h_out.times do |oh|
               w_out.times do |ow|
@@ -449,6 +495,40 @@ module GS
         @local_features_fc2 = NN::Linear.new(7168, 6400, device: device)  # 6400 = 25*256 descriptors
       end
 
+      # Forward pass - simplified version using final decoder output
+      # decoder_out: [batch, seq_len, embed_dim]
+      # Returns: {points: [batch, H, W, 3], conf: [batch, H, W, 1]}
+      # Note: H, W are at patch resolution (e.g., 32x32 for 512px/16patch)
+      def forward(decoder_out : Autograd::Variable, patch_h : Int32, patch_w : Int32) : {Autograd::Variable, Autograd::Variable}
+        # Reshape from [batch, seq, dim] to [batch, H, W, dim]
+        batch = decoder_out.data.shape[0]
+        seq_len = decoder_out.data.shape[1]
+        dim = decoder_out.data.shape[2]
+
+        # Reshape to spatial: [batch, patch_h, patch_w, 768]
+        spatial = reshape_to_spatial(decoder_out, batch, patch_h, patch_w, dim)
+
+        # SIMPLIFIED DPT for CPU inference:
+        # Skip heavy upsampling (would go 32->64->128->256, way too slow)
+        # Instead: work at native 32x32 resolution throughout
+
+        # Project to 256 channels
+        x = @scratch_layers[3].forward(spatial)
+
+        # Single refinenet at native resolution (skip upsampling)
+        x = @refinenets[3].forward(x)
+
+        # Output head: 256 -> 128 -> 128 -> 4
+        x = relu(x)
+        x = @head[0].forward(x)
+        x = relu(x)
+        x = @head[1].forward(x)
+        x = @head[2].forward(x)  # 4 channels output
+
+        # Split into points (xyz) and confidence
+        split_output(x)
+      end
+
       def parameters : Array(Autograd::Variable)
         params = [] of Autograd::Variable
 
@@ -464,6 +544,114 @@ module GS
         params += @local_features_fc2.parameters
 
         params
+      end
+
+      private def reshape_to_spatial(x : Autograd::Variable, batch : Int32, h : Int32, w : Int32, dim : Int32) : Autograd::Variable
+        x_cpu = x.data.on_cpu? ? x.data : x.data.to_cpu
+        data = x_cpu.cpu_data.not_nil!
+
+        # [batch, seq, dim] -> [batch, H, W, dim]
+        result = Tensor.new(batch, h, w, dim, device: Tensor::Device::CPU)
+        r_d = result.cpu_data.not_nil!
+
+        batch.times do |b|
+          h.times do |y|
+            w.times do |x_pos|
+              seq_idx = y * w + x_pos
+              dim.times do |d|
+                src_idx = b * h * w * dim + seq_idx * dim + d
+                dst_idx = b * h * w * dim + y * w * dim + x_pos * dim + d
+                r_d[dst_idx] = data[src_idx]
+              end
+            end
+          end
+        end
+
+        Autograd::Variable.new(result, x.requires_grad?)
+      end
+
+      private def upsample_2x(x : Autograd::Variable) : Autograd::Variable
+        x_cpu = x.data.on_cpu? ? x.data : x.data.to_cpu
+        data = x_cpu.cpu_data.not_nil!
+
+        batch = x_cpu.shape[0]
+        h = x_cpu.shape[1]
+        w = x_cpu.shape[2]
+        c = x_cpu.shape[3]
+
+        # Nearest neighbor 2x upsampling
+        result = Tensor.new(batch, h * 2, w * 2, c, device: Tensor::Device::CPU)
+        r_d = result.cpu_data.not_nil!
+
+        batch.times do |b|
+          h.times do |y|
+            w.times do |x_pos|
+              c.times do |ch|
+                src_idx = b * h * w * c + y * w * c + x_pos * c + ch
+                val = data[src_idx]
+
+                # Copy to 2x2 block
+                2.times do |dy|
+                  2.times do |dx|
+                    dst_y = y * 2 + dy
+                    dst_x = x_pos * 2 + dx
+                    dst_idx = b * (h * 2) * (w * 2) * c + dst_y * (w * 2) * c + dst_x * c + ch
+                    r_d[dst_idx] = val
+                  end
+                end
+              end
+            end
+          end
+        end
+
+        Autograd::Variable.new(result, x.requires_grad?)
+      end
+
+      private def relu(x : Autograd::Variable) : Autograd::Variable
+        x_cpu = x.data.on_cpu? ? x.data : x.data.to_cpu
+        result = Tensor.new(x.data.shape, x.data.dtype, Tensor::Device::CPU)
+        x_d = x_cpu.cpu_data.not_nil!
+        r_d = result.cpu_data.not_nil!
+        x.data.numel.times { |i| r_d[i] = x_d[i] > 0 ? x_d[i] : 0.0_f32 }
+        Autograd::Variable.new(result, x.requires_grad?)
+      end
+
+      private def split_output(x : Autograd::Variable) : {Autograd::Variable, Autograd::Variable}
+        x_cpu = x.data.on_cpu? ? x.data : x.data.to_cpu
+        data = x_cpu.cpu_data.not_nil!
+
+        batch = x_cpu.shape[0]
+        h = x_cpu.shape[1]
+        w = x_cpu.shape[2]
+        # x has 4 channels: xyz (3) + conf (1)
+
+        points = Tensor.new(batch, h, w, 3, device: Tensor::Device::CPU)
+        conf = Tensor.new(batch, h, w, 1, device: Tensor::Device::CPU)
+
+        p_d = points.cpu_data.not_nil!
+        c_d = conf.cpu_data.not_nil!
+
+        batch.times do |b|
+          h.times do |y|
+            w.times do |x_pos|
+              base = b * h * w * 4 + y * w * 4 + x_pos * 4
+              p_base = b * h * w * 3 + y * w * 3 + x_pos * 3
+              c_base = b * h * w + y * w + x_pos
+
+              # First 3 channels = xyz
+              p_d[p_base] = data[base]
+              p_d[p_base + 1] = data[base + 1]
+              p_d[p_base + 2] = data[base + 2]
+
+              # 4th channel = confidence (sigmoid)
+              raw_conf = data[base + 3]
+              c_d[c_base] = 1.0_f32 / (1.0_f32 + Math.exp(-raw_conf))
+            end
+          end
+        end
+
+        {Autograd::Variable.new(points, x.requires_grad?),
+         Autograd::Variable.new(conf, x.requires_grad?)}
       end
     end
   end

@@ -55,8 +55,8 @@ module GS
 
       def self.fast : SelectionCriteria
         SelectionCriteria.new(
-          min_sharpness: 50.0_f32,
-          min_motion: 0.05_f32,
+          min_sharpness: 10.0_f32,    # Very low threshold
+          min_motion: 0.001_f32,       # Very low motion requirement
           max_frames: 30
         )
       end
