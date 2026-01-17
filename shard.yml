@@ -1,0 +1,22 @@
+name: gsplat
+version: 0.1.0
+
+authors:
+  - Sergey
+
+description: |
+  3D reconstruction using Gaussian Splatting + MASt3R
+  Crystal implementation with Metal compute shaders for Apple Silicon
+
+crystal: ">= 1.10.0"
+
+license: MIT
+
+targets:
+  gsplat:
+    main: src/main.cr
+
+development_dependencies:
+  ameba:
+    github: crystal-ameba/ameba
+    version: ~> 1.5

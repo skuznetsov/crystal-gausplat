@@ -1,0 +1,47 @@
+# Build artifacts
+/build/
+/gsplat
+/gsplat_debug
+*.o
+*.a
+*.dylib
+*.metallib
+*.air
+
+# Crystal
+/lib/
+/.shards/
+/bin/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Test coverage
+/coverage/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Debug symbols
+*.dwarf
+
+# Tool caches
+.claude/
+.agents/
