@@ -2,11 +2,19 @@
 /build/
 /gsplat
 /gsplat_debug
+/test_mastr
 *.o
 *.a
 *.dylib
 *.metallib
 *.air
+
+# Model weights (download via scripts/download_weights.sh)
+/models/
+
+# User data and outputs
+/data/
+/output/
 
 # Crystal
 /lib/
