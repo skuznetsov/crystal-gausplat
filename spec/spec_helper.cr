@@ -16,6 +16,9 @@ require "../src/gaussian_splatting/gaussian"
 require "../src/gaussian_splatting/camera"
 require "../src/export/marching_cubes"
 require "../src/utils/geometry"
+require "../src/video/ffmpeg"
+require "../src/video/reader"
+require "../src/video/frame_selector"
 
 # Initialize Metal once for all tests
 GS::Metal::Device.init!

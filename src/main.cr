@@ -27,6 +27,8 @@ require "./export/stl"
 require "./utils/image_io"
 require "./utils/colmap_loader"
 require "./utils/geometry"
+require "./video/reader"
+require "./video/frame_selector"
 
 module GS
   VERSION = "0.1.0"
@@ -49,6 +51,8 @@ module GS
     command = args.first? || "help"
 
     case command
+    when "scan"
+      run_scan(args[1..]? || [] of String)
     when "train"
       run_train(args[1..]? || [] of String)
     when "render"
@@ -71,11 +75,19 @@ module GS
     Usage: gsplat <command> [options]
 
     Commands:
+      scan    Scan object from video → 3D mesh
       train   Train Gaussian Splatting from images
       render  Render a trained scene
       export  Export mesh to STL/OBJ
       test    Run self-test
       help    Show this help
+
+    Scan options (video to 3D):
+      --video <path>       Input video file (MOV, MP4, MKV, etc.)
+      --output <path>      Output mesh path (default: output.stl)
+      --frames <n>         Maximum frames to extract (default: 50)
+      --quality <preset>   Frame selection: fast, normal, thorough (default: normal)
+      --resolution <n>     Mesh resolution (default: 256)
 
     Train options:
       --images <path>      Path to images directory
@@ -93,6 +105,219 @@ module GS
       --resolution <n>     Marching cubes resolution (default: 256)
 
     HELP
+  end
+
+  def self.run_scan(args : Array(String))
+    video_path = ""
+    output_path = "output.stl"
+    max_frames = 50
+    quality = "normal"
+    resolution = 256
+    format = "stl"
+
+    # Parse args
+    i = 0
+    while i < args.size
+      case args[i]
+      when "--video", "-v"
+        video_path = args[i + 1]? || video_path
+        i += 2
+      when "--output", "-o"
+        output_path = args[i + 1]? || output_path
+        i += 2
+      when "--frames", "-f"
+        max_frames = (args[i + 1]? || "50").to_i
+        i += 2
+      when "--quality", "-q"
+        quality = args[i + 1]? || quality
+        i += 2
+      when "--resolution", "-r"
+        resolution = (args[i + 1]? || "256").to_i
+        i += 2
+      when "--format"
+        format = args[i + 1]? || format
+        i += 2
+      else
+        # Assume bare argument is video path
+        if args[i].ends_with?(".mov") || args[i].ends_with?(".mp4") ||
+           args[i].ends_with?(".MOV") || args[i].ends_with?(".MP4") ||
+           args[i].ends_with?(".mkv") || args[i].ends_with?(".avi")
+          video_path = args[i]
+        end
+        i += 1
+      end
+    end
+
+    if video_path.empty?
+      puts "Error: Video file required"
+      puts "Usage: gsplat scan --video <path> [options]"
+      return
+    end
+
+    unless File.exists?(video_path)
+      puts "Error: Video file not found: #{video_path}"
+      return
+    end
+
+    puts "3D Scan from Video"
+    puts "=" * 50
+    puts "  Video: #{video_path}"
+    puts "  Output: #{output_path}"
+    puts "  Max frames: #{max_frames}"
+    puts "  Quality: #{quality}"
+    puts "  Resolution: #{resolution}"
+    puts
+
+    # Step 1: Extract frames from video
+    puts "Step 1: Extracting frames from video..."
+
+    reader = Video::Reader.new(video_path)
+    info = reader.info
+
+    puts "  Resolution: #{info.width}x#{info.height}"
+    puts "  Duration: #{sprintf("%.1f", info.duration)}s"
+    puts "  FPS: #{sprintf("%.2f", info.fps)}"
+    puts "  Frames: ~#{info.frame_count}"
+
+    # Select frame extraction criteria
+    criteria = case quality
+               when "fast"
+                 Video::SelectionCriteria.fast
+               when "thorough"
+                 Video::SelectionCriteria.thorough
+               else
+                 Video::SelectionCriteria.new(max_frames: max_frames)
+               end
+    criteria = Video::SelectionCriteria.new(
+      min_sharpness: criteria.min_sharpness,
+      min_brightness: criteria.min_brightness,
+      max_brightness: criteria.max_brightness,
+      min_motion: criteria.min_motion,
+      max_frames: max_frames,
+      uniform_distribution: true
+    )
+
+    selector = Video::FrameSelector.new(reader, criteria)
+
+    frames = selector.select_with_progress do |current, total|
+      print "\r  Analyzing: #{current}/#{total} frames..."
+      STDOUT.flush
+    end
+    puts
+
+    reader.close
+
+    puts "  Selected #{frames.size} frames"
+
+    if frames.empty?
+      puts "Error: No suitable frames found. Try lowering quality threshold."
+      return
+    end
+
+    # Step 2: Initialize MASt3R for dense stereo
+    puts "\nStep 2: Running MASt3R dense stereo..."
+
+    # For now, use frame pairs to estimate depth
+    # TODO: Full MASt3R inference when weights are loaded
+    puts "  (Using placeholder - MASt3R weights not loaded)"
+    puts "  Generating point cloud from frame differences..."
+
+    # Simple point cloud generation from frames
+    # In real implementation, MASt3R would provide dense depth
+    points = generate_points_from_frames(frames)
+    puts "  Generated #{points.shape[0]} points"
+
+    # Step 3: Initialize Gaussians
+    puts "\nStep 3: Initializing Gaussians..."
+    gaussians = GaussianSplatting::Gaussian3D.from_points(points)
+    puts "  Gaussians: #{gaussians.count}"
+
+    # Step 4: Train (abbreviated for video scan)
+    puts "\nStep 4: Quick optimization..."
+    puts "  (Skipping full training for demo)"
+
+    # Step 5: Export mesh
+    puts "\nStep 5: Extracting mesh..."
+    export_points_to_mesh(points, output_path, resolution, 0.5_f32, format)
+
+    puts "\n" + "=" * 50
+    puts "Scan complete! Output: #{output_path}"
+  end
+
+  # Generate point cloud from video frames (placeholder)
+  # In real implementation, MASt3R would provide dense stereo
+  private def self.generate_points_from_frames(frames : Array(Video::Frame)) : Tensor
+    return Tensor.new(0, 3, device: Tensor::Device::CPU) if frames.empty?
+
+    # For demo: extract corners/features from each frame
+    # and triangulate to 3D (very simplified)
+    points_list = [] of {Float32, Float32, Float32}
+
+    # Use first frame dimensions
+    height = frames[0].data.shape[0]
+    width = frames[0].data.shape[1]
+
+    # Sample sparse points from frames with some depth variation
+    frames.each_with_index do |frame, frame_idx|
+      data = frame.data.cpu_data.not_nil!
+
+      # Find high-gradient (edge) points
+      step = 8
+      (step...height - step).step(step) do |y|
+        (step...width - step).step(step) do |x|
+          # Simple gradient magnitude
+          idx = (y * width + x) * 3
+          idx_r = (y * width + (x + 1)) * 3
+          idx_d = ((y + 1) * width + x) * 3
+
+          dx = (data[idx_r] - data[idx]).abs +
+               (data[idx_r + 1] - data[idx + 1]).abs +
+               (data[idx_r + 2] - data[idx + 2]).abs
+
+          dy = (data[idx_d] - data[idx]).abs +
+               (data[idx_d + 1] - data[idx + 1]).abs +
+               (data[idx_d + 2] - data[idx + 2]).abs
+
+          gradient = dx + dy
+
+          # Keep high-gradient points
+          if gradient > 0.1_f32
+            # Project to 3D with synthetic depth
+            # This is a placeholder - real depth comes from stereo matching
+            norm_x = (x.to_f32 / width - 0.5_f32) * 2.0_f32
+            norm_y = (y.to_f32 / height - 0.5_f32) * 2.0_f32
+            depth = 1.0_f32 + (frame_idx.to_f32 / frames.size) * 0.5_f32
+
+            # Camera position varies with frame
+            angle = (frame_idx.to_f32 / frames.size) * 2.0_f32 * Math::PI.to_f32
+            cam_x = Math.cos(angle).to_f32 * 2.0_f32
+            cam_z = Math.sin(angle).to_f32 * 2.0_f32
+
+            # Unproject point
+            world_x = cam_x + norm_x * depth
+            world_y = norm_y * depth
+            world_z = cam_z + depth
+
+            points_list << {world_x, world_y, world_z}
+          end
+        end
+      end
+    end
+
+    # Create tensor from points
+    n_points = points_list.size
+    n_points = Math.min(n_points, 10000)  # Limit for performance
+
+    points = Tensor.new(n_points, 3, device: Tensor::Device::CPU)
+    data = points.cpu_data.not_nil!
+
+    n_points.times do |i|
+      data[i * 3] = points_list[i][0]
+      data[i * 3 + 1] = points_list[i][1]
+      data[i * 3 + 2] = points_list[i][2]
+    end
+
+    points
   end
 
   def self.run_train(args : Array(String))
