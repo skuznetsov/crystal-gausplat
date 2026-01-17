@@ -29,6 +29,9 @@ require "./utils/colmap_loader"
 require "./utils/geometry"
 require "./video/reader"
 require "./video/frame_selector"
+require "./vision/coreml"
+require "./vision/detector"
+require "./vision/tracker"
 
 module GS
   VERSION = "0.1.0"
@@ -53,6 +56,8 @@ module GS
     case command
     when "scan"
       run_scan(args[1..]? || [] of String)
+    when "track"
+      run_track(args[1..]? || [] of String)
     when "train"
       run_train(args[1..]? || [] of String)
     when "render"
@@ -76,11 +81,19 @@ module GS
 
     Commands:
       scan    Scan object from video → 3D mesh
+      track   Track objects in dashcam video → 3D per object
       train   Train Gaussian Splatting from images
       render  Render a trained scene
       export  Export mesh to STL/OBJ
       test    Run self-test
       help    Show this help
+
+    Track options (dashcam → 3D objects):
+      --video <path>       Input dashcam video
+      --model <path>       YOLO model path (.mlmodel or .mlmodelc)
+      --output <dir>       Output directory for tracked objects
+      --target <id>        Track specific object ID (or "all")
+      --class <name>       Filter by class: car, truck, person, etc.
 
     Scan options (video to 3D):
       --video <path>       Input video file (MOV, MP4, MKV, etc.)
@@ -242,6 +255,266 @@ module GS
 
     puts "\n" + "=" * 50
     puts "Scan complete! Output: #{output_path}"
+  end
+
+  def self.run_track(args : Array(String))
+    video_path = ""
+    model_path = ""
+    output_dir = "./tracked_objects"
+    target_id = "all"
+    filter_class = "car"
+    resolution = 256
+
+    # Parse args
+    i = 0
+    while i < args.size
+      case args[i]
+      when "--video", "-v"
+        video_path = args[i + 1]? || video_path
+        i += 2
+      when "--model", "-m"
+        model_path = args[i + 1]? || model_path
+        i += 2
+      when "--output", "-o"
+        output_dir = args[i + 1]? || output_dir
+        i += 2
+      when "--target", "-t"
+        target_id = args[i + 1]? || target_id
+        i += 2
+      when "--class", "-c"
+        filter_class = args[i + 1]? || filter_class
+        i += 2
+      when "--resolution", "-r"
+        resolution = (args[i + 1]? || "256").to_i
+        i += 2
+      else
+        # Assume bare argument is video path
+        if args[i].ends_with?(".mov") || args[i].ends_with?(".mp4") ||
+           args[i].ends_with?(".MOV") || args[i].ends_with?(".MP4")
+          video_path = args[i]
+        end
+        i += 1
+      end
+    end
+
+    if video_path.empty?
+      puts "Error: Video file required"
+      puts "Usage: gsplat track --video <dashcam.mov> --model <yolov8.mlmodel>"
+      return
+    end
+
+    unless File.exists?(video_path)
+      puts "Error: Video file not found: #{video_path}"
+      return
+    end
+
+    puts "Object Tracking + 3D Reconstruction"
+    puts "=" * 50
+    puts "  Video: #{video_path}"
+    puts "  Model: #{model_path.empty? ? "(downloading YOLOv8n...)" : model_path}"
+    puts "  Output: #{output_dir}"
+    puts "  Target: #{target_id}"
+    puts "  Class filter: #{filter_class}"
+    puts
+
+    # Create output directory
+    Dir.mkdir_p(output_dir)
+
+    # Step 1: Load YOLO model
+    puts "Step 1: Loading YOLO model..."
+
+    # Download if not provided
+    if model_path.empty?
+      model_path = Vision::ModelDownloader.download("yolov8n", File.join(output_dir, "models"))
+    end
+
+    # Configure detector for vehicles
+    filter_classes = case filter_class.downcase
+                     when "car" then [2]  # car
+                     when "truck" then [7]  # truck
+                     when "vehicle" then Vision::VEHICLE_CLASSES
+                     when "person" then [0]  # person
+                     else nil  # all classes
+                     end
+
+    detector_config = Vision::DetectorConfig.new(
+      confidence_threshold: 0.4_f32,
+      nms_threshold: 0.5_f32,
+      filter_classes: filter_classes
+    )
+
+    tracker = Vision::DetectorTracker.new(detector_config)
+
+    unless tracker.load_model(model_path)
+      puts "Error: Failed to load YOLO model from #{model_path}"
+      return
+    end
+
+    puts "  Model loaded: #{model_path}"
+
+    # Step 2: Process video with detection + tracking
+    puts "\nStep 2: Processing video with detection + tracking..."
+
+    reader = Video::Reader.new(video_path)
+    info = reader.info
+
+    puts "  Resolution: #{info.width}x#{info.height}"
+    puts "  Duration: #{sprintf("%.1f", info.duration)}s"
+    puts "  FPS: #{sprintf("%.2f", info.fps)}"
+
+    frame_count = 0
+    object_frames = Hash(Int32, Array(Video::Frame)).new { |h, k| h[k] = [] of Video::Frame }
+
+    reader.each_frame do |frame|
+      frame_count += 1
+
+      # Run detection + tracking
+      detections = tracker.process(frame)
+
+      # Store frames for each tracked object
+      detections.each do |det|
+        if target_id == "all" || det.track_id.to_s == target_id
+          # Crop the detected region for 3D reconstruction
+          object_frames[det.track_id] << frame
+        end
+      end
+
+      if frame_count % 30 == 0
+        active = tracker.active_tracks.size
+        print "\r  Frame #{frame_count}: #{active} active tracks, #{object_frames.size} total objects..."
+        STDOUT.flush
+      end
+    end
+    puts
+
+    reader.close
+
+    puts "  Processed #{frame_count} frames"
+    puts "  Found #{object_frames.size} tracked objects"
+
+    # Step 3: Generate 3D for each tracked object
+    puts "\nStep 3: Generating 3D models for tracked objects..."
+
+    object_frames.each do |track_id, frames|
+      next if frames.size < 10  # Need minimum frames
+
+      track = tracker.get_track(track_id)
+      class_name = track.try(&.class_name) || "unknown"
+
+      puts "  Object #{track_id} (#{class_name}): #{frames.size} frames"
+
+      # Get track history for this object
+      history = tracker.get_track_history(track_id)
+
+      # Generate point cloud from tracked frames
+      # TODO: Use cropped regions around bounding boxes
+      points = generate_points_from_tracked_object(frames, history)
+
+      if points.shape[0] > 100
+        output_path = File.join(output_dir, "object_#{track_id}_#{class_name}.stl")
+        export_points_to_mesh(points, output_path, resolution, 0.5_f32, "stl")
+        puts "    → #{output_path}"
+      else
+        puts "    → Skipped (insufficient points)"
+      end
+    end
+
+    tracker.release
+
+    puts "\n" + "=" * 50
+    puts "Tracking complete! Output: #{output_dir}"
+  end
+
+  # Generate point cloud from tracked object frames
+  private def self.generate_points_from_tracked_object(
+    frames : Array(Video::Frame),
+    history : Array({Float64, Vision::Detection})
+  ) : Tensor
+    return Tensor.new(0, 3, device: Tensor::Device::CPU) if frames.empty?
+
+    points_list = [] of {Float32, Float32, Float32}
+
+    # Use bounding box history to crop relevant regions
+    frames.each_with_index do |frame, idx|
+      data = frame.data.cpu_data.not_nil!
+      height = frame.data.shape[0]
+      width = frame.data.shape[1]
+
+      # Find corresponding detection in history
+      det = if idx < history.size
+              history[idx][1]
+            else
+              nil
+            end
+
+      # Get bounding box (or use full frame)
+      x1, y1, w, h = if det
+                       det.to_pixels(width, height)
+                     else
+                       {0, 0, width, height}
+                     end
+
+      # Ensure bounds
+      x1 = x1.clamp(0, width - 1)
+      y1 = y1.clamp(0, height - 1)
+      x2 = (x1 + w).clamp(0, width - 1)
+      y2 = (y1 + h).clamp(0, height - 1)
+
+      # Sample points from bounding box region
+      step = 4
+      (y1...y2).step(step) do |y|
+        (x1...x2).step(step) do |x|
+          idx_base = (y * width + x) * 3
+          next if idx_base + 2 >= data.size
+
+          r = data[idx_base]
+          g = data[idx_base + 1]
+          b = data[idx_base + 2]
+
+          # Simple gradient detection
+          if x + 1 < x2 && y + 1 < y2
+            idx_r = (y * width + (x + 1)) * 3
+            idx_d = ((y + 1) * width + x) * 3
+
+            dx = (data[idx_r] - r).abs + (data[idx_r + 1] - g).abs + (data[idx_r + 2] - b).abs
+            dy = (data[idx_d] - r).abs + (data[idx_d + 1] - g).abs + (data[idx_d + 2] - b).abs
+
+            gradient = dx + dy
+
+            if gradient > 0.1_f32
+              # Synthetic 3D position based on frame index and pixel position
+              norm_x = ((x - x1).to_f32 / (x2 - x1).to_f32 - 0.5_f32) * 2.0_f32
+              norm_y = ((y - y1).to_f32 / (y2 - y1).to_f32 - 0.5_f32) * 2.0_f32
+
+              # Varying viewpoint based on frame
+              angle = (idx.to_f32 / frames.size) * Math::PI.to_f32
+              depth = 1.0_f32 + Random.rand(0.2_f32)
+
+              world_x = Math.cos(angle).to_f32 * depth + norm_x * 0.5_f32
+              world_y = norm_y * 0.5_f32
+              world_z = Math.sin(angle).to_f32 * depth
+
+              points_list << {world_x, world_y, world_z}
+            end
+          end
+        end
+      end
+    end
+
+    # Create tensor
+    n_points = Math.min(points_list.size, 10000)
+    return Tensor.new(0, 3, device: Tensor::Device::CPU) if n_points == 0
+
+    points = Tensor.new(n_points, 3, device: Tensor::Device::CPU)
+    tensor_data = points.cpu_data.not_nil!
+
+    n_points.times do |i|
+      tensor_data[i * 3] = points_list[i][0]
+      tensor_data[i * 3 + 1] = points_list[i][1]
+      tensor_data[i * 3 + 2] = points_list[i][2]
+    end
+
+    points
   end
 
   # Generate point cloud from video frames (placeholder)

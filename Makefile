@@ -8,6 +8,7 @@ SOURCES = $(shell find src -name "*.cr")
 METAL_SOURCES = $(shell find src/metal/kernels -name "*.metal")
 OBJC_SOURCES = src/metal/bridge.mm
 FFMPEG_SOURCES = src/video/ffmpeg_bridge.c
+COREML_SOURCES = src/vision/coreml_bridge.mm
 
 # Output
 OUTPUT = gsplat
@@ -50,24 +51,33 @@ $(BUILD_DIR)/ffmpeg_bridge.o: $(FFMPEG_SOURCES) | $(BUILD_DIR)
 	clang -c $(FFMPEG_SOURCES) -o $(BUILD_DIR)/ffmpeg_bridge.o \
 		$(FFMPEG_CFLAGS) -fPIC
 
+# Build CoreML/Vision bridge
+$(BUILD_DIR)/coreml_bridge.o: $(COREML_SOURCES) | $(BUILD_DIR)
+	clang++ -c $(COREML_SOURCES) -o $(BUILD_DIR)/coreml_bridge.o \
+		-std=c++17 -fobjc-arc -fPIC
+
+# All bridge objects
+BRIDGE_OBJS = $(BUILD_DIR)/bridge.o $(BUILD_DIR)/ffmpeg_bridge.o $(BUILD_DIR)/coreml_bridge.o
+LINK_FLAGS = -framework Metal -framework Foundation -framework CoreML -framework Vision -framework Accelerate -framework CoreGraphics -lc++ $(FFMPEG_LIBS)
+
 # Build main executable
-$(OUTPUT): $(SOURCES) $(BUILD_DIR)/bridge.o $(BUILD_DIR)/ffmpeg_bridge.o
+$(OUTPUT): $(SOURCES) $(BRIDGE_OBJS)
 	$(CRYSTAL) build src/main.cr -o $(OUTPUT) $(CRYSTAL_FLAGS) \
-		--link-flags="$(shell pwd)/$(BUILD_DIR)/bridge.o $(shell pwd)/$(BUILD_DIR)/ffmpeg_bridge.o -framework Metal -framework Foundation -lc++ $(FFMPEG_LIBS)"
+		--link-flags="$(shell pwd)/$(BUILD_DIR)/bridge.o $(shell pwd)/$(BUILD_DIR)/ffmpeg_bridge.o $(shell pwd)/$(BUILD_DIR)/coreml_bridge.o $(LINK_FLAGS)"
 
 # Debug build
-debug: $(BUILD_DIR) $(BUILD_DIR)/bridge.o $(BUILD_DIR)/ffmpeg_bridge.o
+debug: $(BUILD_DIR) $(BRIDGE_OBJS)
 	$(CRYSTAL) build src/main.cr -o $(OUTPUT)_debug \
-		--link-flags="$(shell pwd)/$(BUILD_DIR)/bridge.o $(shell pwd)/$(BUILD_DIR)/ffmpeg_bridge.o -framework Metal -framework Foundation -lc++ $(FFMPEG_LIBS)"
+		--link-flags="$(shell pwd)/$(BUILD_DIR)/bridge.o $(shell pwd)/$(BUILD_DIR)/ffmpeg_bridge.o $(shell pwd)/$(BUILD_DIR)/coreml_bridge.o $(LINK_FLAGS)"
 
 # Run tests (old internal test)
 test: release
 	./$(OUTPUT) test
 
 # Run Crystal specs
-spec: $(BUILD_DIR)/bridge.o $(BUILD_DIR)/ffmpeg_bridge.o
+spec: $(BRIDGE_OBJS)
 	$(CRYSTAL) spec \
-		--link-flags="$(shell pwd)/$(BUILD_DIR)/bridge.o $(shell pwd)/$(BUILD_DIR)/ffmpeg_bridge.o -framework Metal -framework Foundation -lc++ $(FFMPEG_LIBS)"
+		--link-flags="$(shell pwd)/$(BUILD_DIR)/bridge.o $(shell pwd)/$(BUILD_DIR)/ffmpeg_bridge.o $(shell pwd)/$(BUILD_DIR)/coreml_bridge.o $(LINK_FLAGS)"
 
 # Run with arguments
 run: release

@@ -19,6 +19,9 @@ require "../src/utils/geometry"
 require "../src/video/ffmpeg"
 require "../src/video/reader"
 require "../src/video/frame_selector"
+require "../src/vision/coreml"
+require "../src/vision/detector"
+require "../src/vision/tracker"
 
 # Initialize Metal once for all tests
 GS::Metal::Device.init!
